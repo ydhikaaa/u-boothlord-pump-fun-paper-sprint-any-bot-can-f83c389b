@@ -1,15 +1,23 @@
-// Pump.fun Paper Sprint — disciplined momentum paper bot.
+// Pump.fun Paper Sprint — cliff-rebound paper bot.
 //
-// Strategy in one paragraph: buy young bonding curves whose recent order
-// flow is strong, broad and accelerating while price sits near its
-// short-window high and the curve's real SOL reserve is mid-sized and
-// rising. Size each position at 0.50 SOL, capped by the harness rule of
-// 1% of the mint's real reserve. Exit asymmetrically: a fixed stop-loss
-// caps the downside, a trailing stop (never a hard take-profit) lets
-// winners run, a 900-slot max hold recycles capital out of stalled
-// positions, and a flow-fade exit cuts positions whose tape turns
-// against them. A tiny late-window probe backstop (added below) guards
-// the 20-coin breadth minimum on the short 6-hour final window.
+// Strategy in one paragraph: most pump.fun curves that pump hard then
+// fall 25-50% keep falling — but a minority form a base and rebound, and
+// a few of those run all the way to curve completion. This bot buys only
+// that confirmed base: the coin was broadly bought earlier, price sits
+// 25-50% below its 1500-slot high, the window low is at least 100 slots
+// old, the last 150 slots of flow are net positive with prices flat to
+// rising, and the whole setup has persisted for at least 30 slots before
+// capital is committed. Exits bank the rebound quickly (take-profit at
+// +15%, a trailing stop behind it), cut failures fast (stop-loss -4%, a
+// 150-slot flat-line exit for bases that never bounce, a flow-fade exit),
+// and recycle capital after 500 slots. A tiny late-window probe backstop
+// guards the 20-coin breadth minimum on the short 6-hour final window.
+//
+// Why not momentum: eleven measured variants on the dev window (chasing
+// strength, sniping launches, spraying new curves, riding near-complete
+// curves) all lost more than this design; buying confirmed strength on
+// this tape systematically buys local tops. The rebound design was the
+// closest to breakeven of everything measured, with the lowest drawdown.
 //
 // Deterministic by construction: no clock, no randomness, no I/O — every
 // decision is a pure function of the event stream seen so far.
@@ -19,29 +27,35 @@ import type { Batch, BotState, OrderInput } from './vendor/makefun-bot.ts';
 
 const SOL = 1_000_000_000; // lamports per SOL, as a float for signal math
 
-// ---- entry parameters ----
-const STAKE_LAMPORTS = 500_000_000n; // 0.50 SOL target size per position
+// ---- entry parameters (the dip setup) ----
+const STAKE_LAMPORTS = 350_000_000n; // 0.35 SOL target size per position
 const MIN_STAKE_LAMPORTS = 50_000_000n; // skip entries the reserve cap shrinks below 0.05 SOL
-const MIN_AGE_SLOTS = 200; // a curve must be at least this old before we buy
-const WINDOW_SLOTS = 300; // signal window: only trades inside it count
-const MIN_NET_SOL = 2; // net inflow (buys - sells) inside the window
-const MIN_BUYS = 12; // buy trades inside the window
-const MIN_BUYERS = 10; // distinct buyers inside the window
-const MIN_UP = 0.05; // price gain across the window: at least +5%
-const MAX_UP = 1.2; // ... and at most +120% (do not chase vertical tops)
-const NEAR_HIGH = 0.97; // current price at least 97% of the window high
-const MAX_TOP_SHARE = 0.3; // biggest single buyer at most 30% of buy volume
-const ACCEL = 1.5; // second-half net flow at least 1.5x the first half
-const MIN_RQ_SOL = 30; // real quote reserve band, in SOL
+const MIN_AGE_SLOTS = 400; // a curve must be at least this old before we buy
+const WINDOW_SLOTS = 1500; // lookback window for the high, breadth and flow stats
+const MIN_WINDOW_BUYS = 25; // buy trades inside the window: the coin was really traded
+const MIN_WINDOW_BUYERS = 15; // distinct buyers inside the window
+const DIP_MIN = 0.5; // price at least 50% of the window high (down at most 50%)
+const DIP_MAX = 0.75; // price at most 75% of the window high (down at least 25%)
+const MAX_TOP_SHARE = 0.35; // biggest single buyer at most 35% of buy volume
+const MIN_RQ_SOL = 15; // real quote reserve band, in SOL: the curve is not dead
 const MAX_RQ_SOL = 85;
+const RECENT_SPAN_SLOTS = 150; // stabilization is judged on this recent span
+const RECENT_NET_MIN_SOL = 0.5; // recent net flow must be at least +0.5 SOL
+const RECENT300_NET_MIN_SOL = -1; // and the last 300 slots no worse than -1 SOL net
+const RECENT_FLAT = 0.98; // recent prices flat to rising (last >= 98% of span start)
+const LOW_AGE_SLOTS = 100; // the window low must be at least this old
+const CONFIRM_SLOTS = 30; // the full setup must persist this long before we buy
 const COOLDOWN_SLOTS = 300; // no re-entry into a mint this soon after exiting it
 
 // ---- exit parameters ----
-const STOP_LOSS = -0.08; // hard stop at -8% from entry
-const TRAIL_ARM = 0.1; // trailing stop arms once the peak return reaches +10%
-const TRAIL_DROP = 0.1; // ... and fires after a 10% fall from that peak
-const MAX_HOLD_SLOTS = 900; // recycle capital out of positions held this long
-const HOLD_KEEP_RET = 0.1; // ... unless they are up at least +10%: let them ride the trail
+const STOP_LOSS = -0.04; // hard stop at -4% from entry: failed bases are cut fast
+const TAKE_PROFIT = 0.15; // bank the rebound at +15%
+const TRAIL_ARM = 0.12; // trailing stop arms once the peak return reaches +12%
+const TRAIL_DROP = 0.08; // ... and fires after an 8% fall from that peak
+const MAX_HOLD_SLOTS = 500; // recycle capital out of positions held this long
+const HOLD_KEEP_RET = 0.15; // ... unless they are up at least +15%: let them ride the trail
+const FLAT_EXIT_SLOTS = 150; // a base that has not bounced within 150 slots is dead money
+const FLAT_EXIT_RET = 0.02; // ... when it is still under +2%
 const FADE_WINDOW_SLOTS = 150; // recent-flow window for the fade exit
 const FADE_NET_SOL = -1.0; // exit a loser when recent net flow is under -1 SOL
 
@@ -82,6 +96,7 @@ interface Held {
 const tapes = new Map<string, Tape>();
 const held = new Map<string, Held>();
 const tradedMints = new Set<string>();
+const candidateSince = new Map<string, number>();
 const lastExitSlot = new Map<string, number>();
 let firstSlot = -1;
 
@@ -173,11 +188,17 @@ function planExits(state: BotState, batch: Batch, orders: OrderInput[]): void {
     const ret = price / h.entryPrice - 1;
     const peakRet = h.peakPrice / h.entryPrice - 1;
     let sell = false;
-    if (ret <= STOP_LOSS) {
+    if (ret >= TAKE_PROFIT) {
+      sell = true;
+    } else if (ret <= STOP_LOSS) {
       sell = true;
     } else if (peakRet >= TRAIL_ARM && ret <= peakRet - TRAIL_DROP) {
       sell = true;
     } else if (batch.slot - h.entrySlot >= MAX_HOLD_SLOTS && ret < HOLD_KEEP_RET) {
+      sell = true;
+    } else if (batch.slot - h.entrySlot >= FLAT_EXIT_SLOTS && ret < FLAT_EXIT_RET) {
+      // Flat-line exit: a confirmed base that has not bounced within 150
+      // slots is dead money and usually a dying coin; recycle the slot.
       sell = true;
     } else if (ret < 0) {
       const t = tapes.get(mint);
@@ -192,22 +213,15 @@ function planExits(state: BotState, batch: Batch, orders: OrderInput[]): void {
 interface WindowStats {
   buys: number;
   buyers: number;
-  net: number;
-  up: number;
   nearHigh: number;
   topShare: number;
-  accelOk: boolean;
 }
 
 function windowStats(t: Tape, now: number): WindowStats | null {
   const trades = t.trades;
   if (trades.length === 0) return null;
-  const mid = now - WINDOW_SLOTS / 2;
   let buys = 0;
   let buySum = 0;
-  let sellSum = 0;
-  let netFirst = 0;
-  let netSecond = 0;
   let high = 0;
   const buyerVol = new Map<string, number>();
   for (const tr of trades) {
@@ -216,28 +230,17 @@ function windowStats(t: Tape, now: number): WindowStats | null {
       buys++;
       buySum += tr.sol;
       buyerVol.set(tr.user, (buyerVol.get(tr.user) ?? 0) + tr.sol);
-      if (tr.slot <= mid) netFirst += tr.sol;
-      else netSecond += tr.sol;
-    } else {
-      sellSum += tr.sol;
-      if (tr.slot <= mid) netFirst -= tr.sol;
-      else netSecond -= tr.sol;
     }
   }
-  if (buys === 0 || buySum <= 0) return null;
+  if (buys === 0 || buySum <= 0 || high <= 0) return null;
   let top = 0;
   for (const v of buyerVol.values()) if (v > top) top = v;
-  const firstPrice = trades[0].price;
   const lastPrice = trades[trades.length - 1].price;
-  if (firstPrice <= 0 || high <= 0) return null;
   return {
     buys,
     buyers: buyerVol.size,
-    net: buySum - sellSum,
-    up: lastPrice / firstPrice - 1,
     nearHigh: lastPrice / high,
     topShare: top / buySum,
-    accelOk: netFirst > 0 ? netSecond >= ACCEL * netFirst : netSecond >= 1,
   };
 }
 
@@ -264,17 +267,42 @@ function planEntries(state: BotState, batch: Batch, orders: OrderInput[]): void 
     if (batch.slot - created < MIN_AGE_SLOTS) continue;
     const rq = Number(curve.real_quote_reserves) / SOL;
     if (rq < MIN_RQ_SOL || rq > MAX_RQ_SOL) continue;
-    if (t.firstRealQuote === null) continue;
-    const first = t.firstRealQuote;
-    const nowRq = curve.real_quote_reserves;
-    const rising = nowRq * 5n >= first * 6n || nowRq >= first + BigInt(SOL);
-    if (!rising) continue;
     const s = windowStats(t, batch.slot);
     if (s === null) continue;
-    if (s.net < MIN_NET_SOL || s.buys < MIN_BUYS || s.buyers < MIN_BUYERS) continue;
-    if (s.up < MIN_UP || s.up > MAX_UP) continue;
-    if (s.nearHigh < NEAR_HIGH || s.topShare > MAX_TOP_SHARE) continue;
-    if (!s.accelOk) continue;
+    // The dip setup: broadly bought earlier, price 25-50% under the
+    // window high, no single buyer dominating the tape.
+    if (s.buys < MIN_WINDOW_BUYS || s.buyers < MIN_WINDOW_BUYERS) continue;
+    if (s.nearHigh < DIP_MIN || s.nearHigh > DIP_MAX) continue;
+    if (s.topShare > MAX_TOP_SHARE) continue;
+    // Stabilization: recent flow positive, the wider recent span not
+    // collapsing, recent prices flat to rising, and the window low
+    // already formed rather than printing right now.
+    if (recentNet(t, batch.slot, RECENT_SPAN_SLOTS) < RECENT_NET_MIN_SOL) continue;
+    if (recentNet(t, batch.slot, 300) < RECENT300_NET_MIN_SOL) continue;
+    let recentFirst = 0;
+    let recentLast = 0;
+    let lowSlot = -1;
+    let lowPrice = Infinity;
+    for (const tr of t.trades) {
+      if (tr.price < lowPrice) {
+        lowPrice = tr.price;
+        lowSlot = tr.slot;
+      }
+      if (tr.slot > batch.slot - RECENT_SPAN_SLOTS) {
+        if (recentFirst === 0) recentFirst = tr.price;
+        recentLast = tr.price;
+      }
+    }
+    if (recentFirst <= 0 || recentLast < recentFirst * RECENT_FLAT) continue;
+    if (lowSlot < 0 || batch.slot - lowSlot < LOW_AGE_SLOTS) continue;
+    // Confirmation: the full setup must persist for CONFIRM_SLOTS before
+    // capital is committed; a setup that flashes and dies is skipped.
+    const seenAt = candidateSince.get(mint);
+    if (seenAt === undefined) {
+      candidateSince.set(mint, batch.slot);
+      continue;
+    }
+    if (batch.slot - seenAt < CONFIRM_SLOTS) continue;
     let stake = state.maxBuyLamports(mint);
     if (stake > STAKE_LAMPORTS) stake = STAKE_LAMPORTS;
     if (stake < MIN_STAKE_LAMPORTS) continue;
